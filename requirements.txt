@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-fastapi_poe
-httpx
-alpaca-trade-api
-yfinance
+requests
+pandas
+numpy
+ta
