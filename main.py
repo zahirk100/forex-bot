@@ -1,201 +1,237 @@
-import os, re, json, time
-from fastapi import FastAPI, Request, Header
-from fastapi.responses import JSONResponse, PlainTextResponse
+import os, time, asyncio, json, uuid, logging, math
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import requests
+from fastapi import FastAPI, Request, Response
+from ta.trend import EMAIndicator
+from ta.momentum import RSIIndicator
 
-# ---- Alpaca config ----
-from alpaca_trade_api import REST as ALPACA_REST
-ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-MODE              = (os.getenv("MODE") or "alpaca_paper").strip().lower()
-ALPACA_BASE_URL   = "https://paper-api.alpaca.markets" if "paper" in MODE else "https://api.alpaca.markets"
+# ------------- Config -------------
+ALPACA_API_BASE = os.getenv("ALPACA_API_BASE", "https://paper-api.alpaca.markets").rstrip("/")
+ALPACA_DATA_BASE = os.getenv("ALPACA_DATA_BASE", "https://data.alpaca.markets").rstrip("/")
+API_KEY = os.getenv("ALPACA_API_KEY_ID")
+API_SECRET = os.getenv("ALPACA_API_SECRET_KEY")
+MODE = os.getenv("MODE", "alpaca_paper")
+SYMBOLS = [s.strip() for s in os.getenv("TRADE_SYMBOLS", "BTC/USD").split(",") if s.strip()]
+RISK_USD = float(os.getenv("RISK_PER_TRADE_USD", "50"))
+MAX_POS_USD = float(os.getenv("MAX_POSITION_USD", "200"))
+TIMEFRAME = os.getenv("TIMEFRAME", "1Min")
+ENABLE_TRADING = os.getenv("ENABLE_TRADING", "true").lower() == "true"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Poe access key (vereist!)
-ACCESS_KEY = os.getenv("ACCESS_KEY")
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+log = logging.getLogger("trader")
+
+HEADERS = {
+    "APCA-API-KEY-ID": API_KEY or "",
+    "APCA-API-SECRET-KEY": API_SECRET or "",
+    "Content-Type": "application/json",
+}
 
 app = FastAPI()
 
-# Alpaca client (alleen voor crypto orders)
-alpaca = None
-if ALPACA_KEY_ID and ALPACA_SECRET_KEY:
-    alpaca = ALPACA_REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, base_url=ALPACA_BASE_URL)
+# ------------- Helpers -------------
+def _now():
+    return datetime.now(timezone.utc).isoformat()
 
-# ---------- helpers ----------
-def ok(data): return JSONResponse(data)
-def err(msg): return JSONResponse({"error": str(msg)}, status_code=400)
+def alpaca_get(path, params=None, data_api=False):
+    base = ALPACA_DATA_BASE if data_api else ALPACA_API_BASE
+    url = f"{base}{path}"
+    r = requests.get(url, headers=HEADERS, params=params, timeout=20)
+    if r.status_code >= 400:
+        raise RuntimeError(f"GET {path} {r.status_code} {r.text}")
+    return r.json()
 
-def require_access(req: Request, access_key_header: str | None):
-    if not ACCESS_KEY:
-        return True  # geen check ingesteld
-    return (access_key_header or "") == ACCESS_KEY
+def alpaca_post(path, payload):
+    url = f"{ALPACA_API_BASE}{path}"
+    r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=20)
+    if r.status_code >= 400:
+        raise RuntimeError(f"POST {path} {r.status_code} {r.text}")
+    return r.json()
 
-def format_money(x):
+def alpaca_delete(path):
+    url = f"{ALPACA_API_BASE}{path}"
+    r = requests.delete(url, headers=HEADERS, timeout=20)
+    if r.status_code >= 400:
+        raise RuntimeError(f"DELETE {path} {r.status_code} {r.text}")
+    return r.json() if r.text else {}
+
+def get_account():
+    return alpaca_get("/v2/account")
+
+def get_position(symbol):
     try:
-        return f"{float(x):,.2f}"
-    except:
-        return str(x)
+        return alpaca_get(f"/v2/positions/{symbol.replace('/','%2F')}")
+    except Exception:
+        return None
 
-def account_info():
-    if not alpaca: return "Alpaca client niet geconfigureerd."
-    a = alpaca.get_account()
-    lines = [
-        "📊 **Alpaca Paper account**",
-        f"- Status: **{a.status.upper()}**",
-        f"- Equity: {format_money(a.equity)}",
-        f"- Cash: {format_money(a.cash)}",
-        f"- Buying power: {format_money(a.buying_power)}",
-    ]
-    return "\n".join(lines)
+def get_open_orders(symbol=None):
+    params = {"status": "open"}
+    if symbol:
+        params["symbols"] = symbol
+    return alpaca_get("/v2/orders", params=params)
 
-def list_positions():
-    if not alpaca: return "Alpaca client niet geconfigureerd."
-    poss = alpaca.list_positions()
-    if not poss: return "Geen open posities."
-    out = ["**Open positions**"]
-    for p in poss:
-        if getattr(p, "asset_class", "crypto").lower() != "crypto":
-            continue
-        side = "LONG" if float(p.qty) > 0 else "SHORT"
-        out.append(f"- {p.symbol} • {side} {p.qty} @ {p.avg_entry_price} (unrealized P/L {format_money(p.unrealized_pl)})")
-    return "\n".join(out) if len(out) > 1 else "Geen open crypto-posities."
-
-def place_crypto_order(symbol, side, notional_usd):
-    if not alpaca: return "Alpaca client niet geconfigureerd."
-    o = alpaca.submit_order(
-        symbol=symbol,  # "BTC/USD"
-        side=side,      # "buy" of "sell"
-        type="market",
-        notional=str(notional_usd),
-        time_in_force="gtc"
-    )
-    return f"✅ Order geplaatst: **{side.upper()} {symbol}** voor ~${notional_usd}. Order id: `{o.id}`"
-
-def price_btc():
-    # haal laatste trade via positions of orders fallback; eenvoudiger: gebruik yfinance ook voor BTC
+def cancel_all_orders():
     try:
-        data = yf.download("BTC-USD", period="1d", interval="1m", progress=False)
-        last = float(data["Close"].dropna().iloc[-1])
-        return f"BTC/USD ~ **${format_money(last)}**"
+        alpaca_delete("/v2/orders")
     except Exception as e:
-        return f"Kon BTC prijs niet ophalen: {e}"
+        log.warning(f"Cancel orders error: {e}")
 
-def price_eurusd():
+def place_market_notional(symbol, side, notional_usd):
+    payload = {
+        "symbol": symbol,
+        "side": side,
+        "type": "market",
+        "time_in_force": "gtc",
+        "notional": round(float(notional_usd), 2),
+        "client_order_id": f"auto-{uuid.uuid4().hex[:12]}",
+    }
+    return alpaca_post("/v2/orders", payload)
+
+def close_position(symbol):
     try:
-        # Yahoo Finance forex ticker
-        data = yf.download("EURUSD=X", period="1d", interval="1m", progress=False)
-        last = float(data["Close"].dropna().iloc[-1])
-        return f"EUR/USD ~ **{last:.5f}**"
+        return alpaca_delete(f"/v2/positions/{symbol.replace('/','%2F')}")
     except Exception as e:
-        return f"Kon EURUSD prijs niet ophalen: {e}"
+        log.info(f"No position to close for {symbol}: {e}")
+        return {}
 
-def signal_eurusd():
+def bars_crypto(symbol, tf="1Min", limit=200):
+    # v1beta3 crypto US bars
+    params = {"symbols": symbol, "timeframe": tf, "limit": limit}
+    j = alpaca_get("/v1beta3/crypto/us/bars", params=params, data_api=True)
+    items = j.get("bars", {}).get(symbol, [])
+    if not items:
+        raise RuntimeError(f"No bars for {symbol}")
+    df = pd.DataFrame(items)
+    # Ensure numeric
+    for col in ["o", "h", "l", "c", "v"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Standardize column names
+    df.rename(columns={"t":"ts","o":"open","h":"high","l":"low","c":"close","v":"volume"}, inplace=True)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df.set_index("ts", inplace=True)
+    return df.sort_index()
+
+# ------------- Strategy -------------
+def signal_ema_rsi(df: pd.DataFrame):
+    """Return 'buy', 'sell', or None based on EMA20/EMA50 + RSI filter."""
+    if len(df) < 60:
+        return None
+    ema_fast = EMAIndicator(close=df["close"], window=20).ema_indicator()
+    ema_slow = EMAIndicator(close=df["close"], window=50).ema_indicator()
+    rsi = RSIIndicator(close=df["close"], window=14).rsi()
+
+    df = df.copy()
+    df["ema_fast"] = ema_fast
+    df["ema_slow"] = ema_slow
+    df["rsi"] = rsi
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    cross_up = prev["ema_fast"] <= prev["ema_slow"] and last["ema_fast"] > last["ema_slow"]
+    cross_dn = prev["ema_fast"] >= prev["ema_slow"] and last["ema_fast"] < last["ema_slow"]
+
+    if cross_up and last["rsi"] > 55:
+        return "buy"
+    if cross_dn or last["rsi"] < 45:
+        return "sell"
+    return None
+
+async def trade_symbol(symbol: str):
     try:
-        df = yf.download("EURUSD=X", period="1mo", interval="30m", progress=False)
-        df = df.dropna()
-        df["sma_fast"] = df["Close"].rolling(10).mean()
-        df["sma_slow"] = df["Close"].rolling(30).mean()
-        # RSI (14)
-        delta = df["Close"].diff()
-        up = delta.clip(lower=0)
-        down = -1*delta.clip(upper=0)
-        rs = (up.ewm(span=14, adjust=False).mean() / down.ewm(span=14, adjust=False).mean()).replace([np.inf, -np.inf], np.nan).fillna(0)
-        df["rsi"] = 100 - (100 / (1 + rs))
+        df = bars_crypto(symbol, TIMEFRAME, 300)
+        sig = signal_ema_rsi(df)
+        acct = get_account()
+        bp = float(acct.get("buying_power", 0))
+        log.info(f"[{symbol}] signal={sig} bp={bp:.2f}")
 
-        last = df.iloc[-1]
-        price = float(last["Close"])
-        cross_up = last["sma_fast"] > last["sma_slow"] and df["sma_fast"].iloc[-2] <= df["sma_slow"].iloc[-2]
-        cross_dn = last["sma_fast"] < last["sma_slow"] and df["sma_fast"].iloc[-2] >= df["sma_slow"].iloc[-2]
+        pos = get_position(symbol)
+        has_long = pos and float(pos.get("qty", 0)) > 0
 
-        decision = "HOLD"
-        if cross_up and last["rsi"] < 65: decision = "BUY"
-        if cross_dn and last["rsi"] > 35: decision = "SELL"
+        if not ENABLE_TRADING:
+            log.info("Trading disabled; skipping order logic.")
+            return
 
-        sl = price * (0.997 if decision == "BUY" else 1.003) if decision in ["BUY","SELL"] else None
-        tp = price * (1.006 if decision == "BUY" else 0.994) if decision in ["BUY","SELL"] else None
+        # Don’t exceed cap
+        if pos:
+            market_value = float(pos.get("market_value", 0))
+        else:
+            market_value = 0.0
 
-        out = [
-            "📈 **EURUSD signal**",
-            f"- Price: {price:.5f}",
-            f"- SMA10: {last['sma_fast']:.5f} | SMA30: {last['sma_slow']:.5f}",
-            f"- RSI(14): {last['rsi']:.1f}",
-            f"- Decision: **{decision}**",
-        ]
-        if sl and tp:
-            out.append(f"- SL: {sl:.5f} | TP: {tp:.5f}")
-        return "\n".join(out)
+        if sig == "buy" and not has_long and bp > RISK_USD and (market_value + RISK_USD) <= MAX_POS_USD:
+            cancel_all_orders()
+            r = place_market_notional(symbol, "buy", RISK_USD)
+            log.info(f"BUY {symbol} notional ${RISK_USD}: {r.get('id')}")
+        elif sig == "sell" and has_long:
+            cancel_all_orders()
+            r = close_position(symbol)
+            log.info(f"CLOSE {symbol}: {r}")
     except Exception as e:
-        return f"Kon signal niet berekenen: {e}"
+        log.error(f"trade_symbol error for {symbol}: {e}")
 
-HELP_TEXT = (
-    "**Commands**\n"
-    "- `account` – status en buying power\n"
-    "- `positions` – open posities\n"
-    "- `price btc` / `price eurusd` – laatste prijs\n"
-    "- `buy btc <notional_usd>` – marktkoop ($ bedrag), bv `buy btc 25`\n"
-    "- `sell btc <notional_usd>` – marktverkoop ($ bedrag)\n"
-    "- `signal eurusd` – SMA/RSI signaal (alleen signal, geen order)\n"
-)
+async def trading_loop():
+    await asyncio.sleep(3)  # give server a moment to boot
+    log.info(f"Trading loop started at {_now()}, symbols={SYMBOLS}, tf={TIMEFRAME}, enable={ENABLE_TRADING}")
+    while True:
+        tasks = [trade_symbol(sym) for sym in SYMBOLS]
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(60)  # run every minute
 
-# ---------- routes ----------
+# ------------- FastAPI -------------
+@app.on_event("startup")
+async def _startup():
+    # Start background trader
+    asyncio.create_task(trading_loop())
+
 @app.get("/")
 def root():
     return {"status": "ok", "mode": MODE}
 
-@app.get("/debug")
-def debug(request: Request, authorization: str | None = Header(default=None),
-          poe_access_key: str | None = Header(default=None), x_access_key: str | None = Header(default=None),
-          user_agent: str | None = Header(default=None)):
-    return PlainTextResponse(json.dumps({
-        "has_ACCESS_KEY": ACCESS_KEY is not None,
-        "received_keys": {"authorization": authorization, "poe-access-key": poe_access_key, "x-access-key": x_access_key},
-        "user-agent": user_agent
-    }))
+@app.get("/health")
+def health():
+    return {"ok": True, "time": _now()}
 
-@app.post("/webhook")
-async def webhook(request: Request,
-                  authorization: str | None = Header(default=None),
-                  poe_access_key: str | None = Header(default=None),
-                  x_access_key: str | None = Header(default=None)):
-    if not require_access(request, authorization or poe_access_key or x_access_key):
-        return JSONResponse({"error": "Forbidden"}, status_code=403)
-
-    body = await request.json()
-    # Poe stuurt het user-bericht in body["messages"][-1]["content"][0]["text"]
+@app.get("/status")
+def status():
     try:
-        messages = body.get("messages") or []
-        last = messages[-1]
-        parts = last.get("content", [])
-        text = ""
-        for p in parts:
-            if p.get("type") == "text":
-                text += p.get("text", "")
-        q = (text or "").strip().lower()
+        acct = get_account()
+        return {
+            "status": "ok",
+            "equity": float(acct.get("equity", 0)),
+            "cash": float(acct.get("cash", 0)),
+            "buying_power": float(acct.get("buying_power", 0)),
+            "trading_enabled": ENABLE_TRADING,
+            "symbols": SYMBOLS,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+# Minimal Poe-compatible webhook (POST only)
+@app.post("/webhook")
+async def webhook(request: Request):
+    try:
+        body = await request.json()
     except Exception:
-        q = ""
-
-    # parsing
-    if q in ["help", "commands", "?"]:
-        return ok({"text": HELP_TEXT})
-    if q.startswith("account"):
-        return ok({"text": account_info()})
-    if q.startswith("positions"):
-        return ok({"text": list_positions()})
-    if q.startswith("price"):
-        if "eurusd" in q:  return ok({"text": price_eurusd()})
-        return ok({"text": price_btc()})
-    if q.startswith("signal") and "eurusd" in q:
-        return ok({"text": signal_eurusd()})
-    m = re.match(r"(buy|sell)\s+btc\s+([0-9]+(?:\.[0-9]+)?)", q)
-    if m:
-        side = m.group(1)
-        notional = float(m.group(2))
+        body = {}
+    text = (body.get("message", "") or body.get("text", "") or "").strip().lower()
+    if text in ["account", "status"]:
+        a = get_account()
+        msg = (f"📊 Alpaca Paper account\n"
+               f"• Status: {a.get('status','?').upper()}\n"
+               f"• Equity: {a.get('equity','?')}\n"
+               f"• Cash: {a.get('cash','?')}\n"
+               f"• Buying power: {a.get('buying_power','?')}")
+        return {"text": msg}
+    elif text in ["positions", "pos"]:
+        out = []
         try:
-            msg = place_crypto_order("BTC/USD", side, notional)
-            return ok({"text": msg})
-        except Exception as e:
-            return ok({"text": f"Order fout: {e}"})
-
-    # fallback
-    return ok({"text": HELP_TEXT})
+            pos = alpaca_get("/v2/positions")
+            for p in pos:
+                out.append(f"{p['symbol']}: qty {p['qty']} mv ${p['market_value']}")
+        except Exception:
+            out.append("No positions")
+        return {"text": "📦 Positions\n" + ("\n".join(out) if out else "No positions")}
+    else:
+        return {"text": "Try: `account` or `positions`"}
