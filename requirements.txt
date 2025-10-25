@@ -1,7 +1,4 @@
 fastapi
-uvicorn[standard]
+uvicorn
+fastapi_poe
 httpx
-requests
-pandas
-numpy
-ta
