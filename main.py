@@ -1,81 +1,65 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
-import os, json, httpx
+import os
+import httpx
+import fastapi_poe as fp
+from fastapi import FastAPI
+from typing import AsyncIterable
 
-app = FastAPI()
+ALPACA_ENDPOINT = os.getenv("ALPACA_ENDPOINT", "https://paper-api.alpaca.markets")
+ALPACA_KEY_ID = os.getenv("ALPACA_KEY_ID", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+POE_ACCESS_KEY = os.getenv("KEY", "")  # ← dit is je Poe “Access key” (niet Alpaca)
 
-MODE = os.getenv("MODE", "alpaca_paper").strip()
-ALPACA_KEY = os.getenv("ALPACA_API_KEY", "").strip()
-ALPACA_SECRET = os.getenv("ALPACA_API_SECRET", "").strip()
-ALPACA_BASE = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()
+# --- Een heel eenvoudige bot die 'account' afhandelt ---
+class ForexBoth(fp.PoeBot):
+    async def get_response(self, request: fp.QueryRequest) -> AsyncIterable[fp.PartialResponse]:
+        user_text = (request.query[-1].content or "").strip().lower()
 
-# --- Simple health/info endpoints ---
+        if user_text in ("account", "1. account", "1 account", "1 account info", "account info"):
+            # Haal accountgegevens bij Alpaca Paper
+            try:
+                headers = {
+                    "APCA-API-KEY-ID": ALPACA_KEY_ID,
+                    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+                }
+                url = f"{ALPACA_ENDPOINT}/v2/account"
+                async with httpx.AsyncClient(timeout=15) as client:
+                    r = await client.get(url, headers=headers)
+                if r.status_code == 200:
+                    acc = r.json()
+                    equity = acc.get("equity")
+                    cash = acc.get("cash")
+                    buying_power = acc.get("buying_power")
+                    status = acc.get("status")
+                    txt = (
+                        "📊 **Alpaca Paper account**\n"
+                        f"• Status: {status}\n"
+                        f"• Equity: {equity}\n"
+                        f"• Cash: {cash}\n"
+                        f"• Buying power: {buying_power}\n"
+                    )
+                    yield fp.PartialResponse(text=txt)
+                else:
+                    yield fp.PartialResponse(
+                        text=f"⚠️ Alpaca error {r.status_code}: {r.text[:300]}"
+                    )
+            except Exception as e:
+                yield fp.PartialResponse(text=f"⚠️ Fout bij Alpaca call: {e}")
+            return
+
+        # Default hulp
+        help_text = (
+            "Hallo! Stuur **account** om je Alpaca Paper account samen te vatten.\n"
+            "Straks voegen we commando’s toe zoals *buy EURUSD*, *close all*, etc."
+        )
+        yield fp.PartialResponse(text=help_text)
+
+# Maak de FastAPI-app volgens Poe’s protocol, op /webhook
+app: FastAPI = fp.make_app(
+    ForexBoth(path="/webhook", access_key=POE_ACCESS_KEY)
+)
+
+# Simpele health-check op /
 @app.get("/")
-def root():
-    return {"status": "ok", "mode": MODE}
-
-@app.get("/health")
 def health():
-    return {"ok": True}
-
-@app.get("/inspect")
-async def inspect(request: Request):
-    # Handy to see what headers Poe sends (in browser they'll be null – that’s fine)
-    hdrs = {k.lower(): v for k, v in request.headers.items()}
-    return PlainTextResponse(json.dumps({
-        "has_ACCESS_KEY": bool(os.getenv("ACCESS_KEY")),
-        "received_keys": {
-            "authorization": hdrs.get("authorization"),
-            "poe-access-key": hdrs.get("poe-access-key"),
-            "x-access-key": hdrs.get("x-access-key"),
-            "user-agent": hdrs.get("user-agent")
-        }
-    }))
-
-# --- Helper: Alpaca account ---
-async def alpaca_account():
-    if not (ALPACA_KEY and ALPACA_SECRET):
-        return {"error": "alpaca_keys_missing"}
-    url = f"{ALPACA_BASE}/v2/account"
-    headers = {
-        "APCA-API-KEY-ID": ALPACA_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET,
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-        # Return a tiny summary
-        return {
-            "id": data.get("id"),
-            "status": data.get("status"),
-            "currency": data.get("currency"),
-            "cash": data.get("cash"),
-            "portfolio_value": data.get("portfolio_value"),
-        }
-
-# --- Poe webhook (POST only) ---
-@app.post("/webhook")
-async def webhook(request: Request):
-    """
-    Poe will POST JSON like:
-    {"message": "account", "user_id":"...", ...}
-    We DO NOT enforce access key for now to avoid 403 while debugging.
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    text = str(body.get("message", "")).strip().lower()
-    # Very simple router
-    if text == "account":
-        try:
-            acc = await alpaca_account()
-            if "error" in acc:
-                return JSONResponse({"ok": False, "error": acc["error"]}, status_code=200)
-            return JSONResponse({"ok": True, "type": "account", "data": acc}, status_code=200)
-        except httpx.HTTPError as e:
-            return JSONResponse({"ok": False, "error": f"alpaca_http_error: {e}"}, status_code=200)
-    else:
-        return JSONResponse({"ok": True, "echo": text or "(empty)"}, status_code=200)
+    mode = "alpaca_paper"
+    return {"status": "ok", "mode": mode}
