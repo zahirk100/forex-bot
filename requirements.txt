@@ -3,4 +3,3 @@ uvicorn
 requests
 pandas
 numpy
-ta
