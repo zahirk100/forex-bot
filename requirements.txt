@@ -1,8 +1,2 @@
-fastapi
-uvicorn
-fastapi
-uvicorn
-requests
-pandas
-numpy
-ta
+fastapi==0.110.0
+uvicorn==0.23.2
