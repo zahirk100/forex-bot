@@ -4,20 +4,38 @@ from broker_alpaca import account, positions, market_order
 
 app = FastAPI()
 
-ACCESS_KEY = os.getenv("ACCESS_KEY", "")  # Poe zet deze in de Authorization header
-MODE = os.getenv("MODE", "alpaca_paper")
+ACCESS_KEY = (os.getenv("ACCESS_KEY") or "").strip()
+MODE = os.getenv("MODE", "alpaca_paper").strip()
 
-def unauthorized(req: Request):
-    return req.headers.get("Authorization") != f"Bearer {ACCESS_KEY}"
+def is_authorized(req: Request) -> bool:
+    if not ACCESS_KEY:
+        return False
+    h = req.headers
+    # Poe kan de key sturen als:
+    # - Authorization: Bearer <key>
+    # - Poe-Access-Key: <key>
+    # - X-Access-Key: <key>  (fallback)
+    auth = (h.get("authorization") or "").replace("Bearer ", "").strip()
+    poe_key = (h.get("poe-access-key") or "").strip()
+    x_key = (h.get("x-access-key") or "").strip()
+    provided = auth or poe_key or x_key
+    return provided == ACCESS_KEY
 
 @app.get("/healthz")
 def health():
     return {"status": "ok", "mode": MODE}
 
+# >>> Tijdelijke debug endpoint om headers te zien (geen secrets loggen)
+@app.get("/debug")
+async def debug(request: Request):
+    h = dict(request.headers)
+    peek = {k: h.get(k) for k in ["authorization","poe-access-key","x-access-key","user-agent"]}
+    return {"has_ACCESS_KEY": bool(ACCESS_KEY), "received_keys": peek}
+
 @app.post("/webhook")
 async def webhook(request: Request):
-    if unauthorized(request):
-        return {"error": "Unauthorized"}
+    if not is_authorized(request):
+        return {"text": "Unauthorized (check ACCESS_KEY ↔ Poe Access key)"}
 
     data = await request.json()
     text = (data.get("message") or data.get("text") or "").strip()
@@ -29,7 +47,7 @@ async def webhook(request: Request):
 
     try:
         if cmd == "help":
-            return {"text": "Commands:\n- account\n- pos\n- buy <symbol> <qty>\n- sell <symbol> <qty>\nVoorbeeld: buy AAPL 1  |  buy BTCUSD 0.01 (als crypto actief is)"}
+            return {"text": "Commands:\n- account\n- pos\n- buy <symbol> <qty>\n- sell <symbol> <qty>\nBijv: buy AAPL 1"}
 
         if cmd == "account":
             a = account()
@@ -46,18 +64,14 @@ async def webhook(request: Request):
             if len(parts) < 3:
                 return {"text": "Gebruik: buy <symbol> <qty>  (bijv. buy AAPL 1)"}
             symbol = parts[1].upper()
-            qty = parts[2]
-            # qty moet int zijn voor stocks, voor crypto pakt Alpaca ook string; we casten safe:
+            qty_str = parts[2]
             try:
-                qty_int = int(float(qty))
+                qty_int = int(float(qty_str))
             except:
-                qty_int = int(qty)
+                qty_int = int(qty_str)
             side = "buy" if cmd == "buy" else "sell"
             o = market_order(symbol=symbol, qty=qty_int, side=side)
-            oid = o.get("id")
-            status = o.get("status")
-            filled = o.get("filled_qty")
-            return {"text": f"{side.upper()} order: {symbol} qty={qty_int} | status={status} | filled={filled} | id={oid}"}
+            return {"text": f"{side.upper()} {symbol} qty={qty_int} | status={o.get('status')} | id={o.get('id')}"}
 
         return {"text": "Onbekend commando. Typ 'help'."}
 
