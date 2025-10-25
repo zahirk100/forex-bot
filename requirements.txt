@@ -1,2 +1,8 @@
 fastapi
 uvicorn
+fastapi
+uvicorn
+requests
+pandas
+numpy
+ta
