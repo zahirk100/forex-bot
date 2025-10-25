@@ -92,6 +92,17 @@ def place_market_order(symbol: str, notional_usd: float, side: str):
     return r.json()
 
 # ---------- Poe webhook ----------
+expected = os.getenv("KEY", "")
+received = _get_access_key_from_headers(
+    authorization=request.headers.get("authorization"),
+    poe_access_key=request.headers.get("poe-access-key"),
+    x_poe_access_key=request.headers.get("x-poe-access-key"),
+    x_access_key=request.headers.get("x-access-key"),
+)
+if not expected or not _consteq(expected, received):
+    # laat een duidelijke log achter
+    print("AUTH_FAIL", {"has_expected": bool(expected), "received_prefix": (received or "")[:3]})
+    return JSONResponse({"error": "forbidden"}, status_code=403)
 def _check_key(request: Request):
     k = (
         request.headers.get("poe-access-key")
