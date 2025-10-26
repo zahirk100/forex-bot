@@ -1,107 +1,62 @@
-import os
-import json
-import requests
-from fastapi import FastAPI, Request, Header, HTTPException
-from pydantic import BaseModel
-from typing import Optional
+from fastapi import FastAPI, Request, Header
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# ====== Config uit environment ======
-ALPACA_KEY_ID = os.getenv("ALPACA_KEY_ID", "").strip()
-ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", os.getenv("ALPACA_SECRET", "")).strip()
-ALPACA_ENDPOINT = os.getenv("ALPACA_ENDPOINT", "https://paper-api.alpaca.markets/v2").rstrip("/")
-MODE = os.getenv("MODE", "alpaca_paper").strip()
-POE_ACCESS_KEY = os.getenv("KEY", "").strip()  # zelfde waarde als je Poe "Access key"
+ACCESS_KEY = None  # vullen via env in Render
 
-# ====== Helpers Alpaca ======
-def alpaca_headers():
-    if not (ALPACA_KEY_ID and ALPACA_SECRET):
-        raise RuntimeError("Alpaca API keys ontbreken (ALPACA_KEY_ID / ALPACA_SECRET_KEY).")
-    return {
-        "APCA-API-KEY-ID": ALPACA_KEY_ID,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+@app.on_event("startup")
+async def _startup():
+    import os
+    global ACCESS_KEY
+    ACCESS_KEY = os.getenv("ACCESS_KEY", "").strip()
 
-def get_account() -> dict:
-    url = f"{ALPACA_ENDPOINT}/account"
-    r = requests.get(url, headers=alpaca_headers(), timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-# ====== Poe Webhook model ======
-class WebhookIn(BaseModel):
-    text: Optional[str] = None
-    message: Optional[str] = None
-
-# ====== Poe auth check ======
-def check_poe_auth(req: Request):
-    # Poe kan sleutel in verschillende headers sturen; accepteer meerdere
-    key = (
-        req.headers.get("poe-access-key")
-        or req.headers.get("x-access-key")
-        or req.headers.get("x-poe-access-key")
-        or req.headers.get("authorization")
-    )
-    if key and key.lower().startswith("bearer "):
-        key = key[7:].strip()
-
-    if POE_ACCESS_KEY:
-        if not key or key != POE_ACCESS_KEY:
-            raise HTTPException(status_code=403, detail="Forbidden")
-    # Als POE_ACCESS_KEY leeg is, staat webhook open (niet aanbevolen).
-
-# ====== Gezondheid / debug ======
 @app.get("/")
-def root():
-    return {"status": "ok", "mode": MODE}
+def health():
+    return {"status": "ok"}
 
-@app.get("/account")
-def account_info():
-    try:
-        acc = get_account()
-        return {
-            "status": acc.get("status"),
-            "currency": acc.get("currency"),
-            "equity": acc.get("equity"),
-            "cash": acc.get("cash"),
-            "buying_power": acc.get("buying_power"),
-            "portfolio_value": acc.get("portfolio_value"),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-# ====== Poe webhook ======
 @app.post("/webhook")
-async def poe_webhook(req: Request, body: WebhookIn):
-    check_poe_auth(req)
-    text = (body.text or body.message or "").strip().lower()
+async def webhook(
+    request: Request,
+    poe_access_key: str | None = Header(default=None, alias="Poe-Access-Key"),
+    x_access_key: str | None = Header(default=None, alias="X-Access-Key"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+):
+    # 1) Key check (één van de headers moet gelijk zijn aan ACCESS_KEY)
+    ok_key = False
+    for k in (poe_access_key, x_access_key, authorization):
+        if k and ACCESS_KEY and k.strip().replace("Bearer ", "") == ACCESS_KEY:
+            ok_key = True
+            break
+    if not ok_key:
+        # Poe verwacht bij auth-fout óók gewoon JSON terug
+        return JSONResponse({"error": "forbidden"}, status_code=403)
 
-    if text in ("help", "/help"):
-        return {
-            "text": (
-                "🧭 *Forexboth help*\n"
-                "- Typ **account** → laat Alpaca paper balans zien.\n"
-                "- (Binnenkort) **buy/sell** en auto-trade.\n"
-                "Je draait nu in modus: " + MODE
-            )
-        }
+    # 2) Poe payload lezen (maar tolerant zijn)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
 
-    if text == "account":
-        try:
-            acc = get_account()
-            reply = (
-                "📊 *Alpaca Paper account*\n"
-                f"- Status: **{acc.get('status')}**\n"
-                f"- Equity: **{acc.get('equity')}**\n"
-                f"- Cash: **{acc.get('cash')}**\n"
-                f"- Buying power: **{acc.get('buying_power')}**"
-            )
-            return {"text": reply}
-        except Exception as e:
-            return {"text": f"⚠️ Fout bij ophalen account: {e}"}
+    # Tekst van de laatste user-message eruit vissen (veilig)
+    user_text = ""
+    try:
+        msgs = body.get("messages", [])
+        for m in reversed(msgs):
+            if m.get("role") == "user":
+                parts = m.get("content", [])
+                for p in parts:
+                    if p.get("type") == "text":
+                        user_text = p.get("text", "")
+                        raise StopIteration
+    except StopIteration:
+        pass
 
-    # default antwoord
-    return {"text": "Stuur **account** voor je balans of **help** voor uitleg."}
+    # 3) Antwoord **in Poe-formaat**: een JSON met minimaal `text`
+    reply = {
+        "text": f"Ik heb je bericht ontvangen: {user_text or '(leeg)'}"
+    }
+    # Optioneel voorbeeld van suggesties:
+    reply["suggested_replies"] = ["account", "help", "ping"]
+
+    return JSONResponse(reply, media_type="application/json")
