@@ -1,113 +1,157 @@
-import os, time
-from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, Request, Header, HTTPException
-from pydantic import BaseModel
-import uvicorn
+import os
+import json
+import logging
+from typing import Dict, Any, Optional
+
 import requests
+from fastapi import FastAPI, Request, Header
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-ACCESS_KEY = os.environ.get("ACCESS_KEY", "").strip()
+# === Config uit env ===
+POE_KEY = os.getenv("KEY") or os.getenv("POE_ACCESS_KEY") or ""
+MODE = (os.getenv("MODE") or "alpaca_paper").strip()
+ALPACA_API_KEY = (os.getenv("ALPACA_API_KEY") or "").strip()
+ALPACA_SECRET_KEY = (os.getenv("ALPACA_SECRET_KEY") or "").strip()
 
-# ---------- Poe response helpers ----------
-def poe_text(text: str, suggestions: Optional[List[str]] = None) -> Dict[str, Any]:
+# Alpaca endpoints
+ALPACA_ACCOUNT_URL = "https://paper-api.alpaca.markets/v2/account"
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("poe-bot")
+
+
+def poe_reply(text: str) -> Dict[str, Any]:
     """
-    Poe Server Bot API minimal valid response.
+    Return exact schema Poe expects.
     """
-    resp = {
-        "version": "1.0",
-        "content": [{"type": "text", "text": text}],
+    return {
+        "choices": [
+            {
+                "content": {
+                    "type": "text",
+                    "text": text
+                },
+                "is_final": True
+            }
+        ]
     }
-    if suggestions:
-        resp["suggested_replies"] = [{"type": "text", "text": s} for s in suggestions]
-    return resp
 
-# ---------- Health ----------
+
 @app.get("/")
+def root():
+    return {"status": "ok", "mode": MODE}
+
+
+@app.get("/health")
 def health():
-    return {"status": "ok"}
+    ok = bool(MODE)
+    return {"ok": ok, "mode": MODE}
 
-# ---------- Webhook ----------
-@app.post("/webhook")
-async def webhook(
-    request: Request,
-    authorization: Optional[str] = Header(default=None),
-    poe_access_key: Optional[str] = Header(default=None, alias="poe-access-key"),
-    x_access_key: Optional[str] = Header(default=None, alias="x-access-key"),
-):
-    # --- Access key check (any of the 3 header names accepted) ---
-    incoming = poe_access_key or x_access_key or authorization
-    if ACCESS_KEY:
-        if not incoming or incoming.strip() != ACCESS_KEY:
-            # Geef Poe duidelijke fout terug zodat je in logs kunt zien wat er mis is
-            raise HTTPException(status_code=403, detail="Forbidden: bad access key")
 
-    # --- Lees payload veilig ---
+@app.get("/mode")
+def get_mode():
+    return {"mode": MODE}
+
+
+def get_user_text(payload: Dict[str, Any]) -> str:
+    """
+    Poe server-bot payloads hebben meestal messages[-1].content[0].text
+    maar we supporten ook simpele {"text":"..."} JSON om lokaal te testen.
+    """
+    # simpele test payload
+    if "text" in payload and isinstance(payload["text"], str):
+        return payload["text"]
+
+    # Poe formaat: {"messages":[{"role":"user","content":[{"type":"text","text":"..."}]}]}
     try:
-        payload = await request.json()
-    except Exception:
-        return poe_text("Kon de JSON van deze aanvraag niet lezen. Probeer het opnieuw.")
-
-    # Poe stuurt meestal iets als: {"message": {"content":[{"type":"text","text":"..."}]}}
-    user_text = ""
-    try:
-        blocks = payload.get("message", {}).get("content", [])
-        for b in blocks:
-            if b.get("type") == "text":
-                user_text += b.get("text", "")
+        msgs = payload.get("messages") or []
+        if msgs:
+            last = msgs[-1]
+            content = last.get("content") or []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    return str(part.get("text") or "").strip()
     except Exception:
         pass
 
-    cmd = user_text.strip().lower()
+    return ""
 
-    # --- Commands ---
-    if cmd in ("help", "menu", ""):
-        return poe_text(
-            "Ik ben online ✅\n\nBeschikbare commando’s:\n"
-            "• account – toont je Alpaca Paper-account\n"
-            "• ping – snelle test\n"
-            "• mode – laat huidige modus zien\n",
-            suggestions=["account", "mode", "ping"]
+
+def alpaca_account_text() -> str:
+    if not (ALPACA_API_KEY and ALPACA_SECRET_KEY):
+        return "⚠️ ALPACA_API_KEY/ALPACA_SECRET_KEY ontbreken in de Render environment."
+
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+    }
+    try:
+        r = requests.get(ALPACA_ACCOUNT_URL, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            status = data.get("status")
+            equity = data.get("equity")
+            cash = data.get("cash")
+            buying_power = data.get("buying_power")
+            return (
+                "📊 Alpaca Paper account\n"
+                f"• Status: {status}\n"
+                f"• Equity: {equity}\n"
+                f"• Cash: {cash}\n"
+                f"• Buying power: {buying_power}"
+            )
+        else:
+            return f"⚠️ Alpaca account call faalde: HTTP {r.status_code} – {r.text[:200]}"
+    except Exception as e:
+        return f"⚠️ Fout bij Alpaca call: {e}"
+
+
+@app.post("/webhook")
+async def webhook(
+    request: Request,
+    poe_access_key: Optional[str] = Header(None, convert_underscores=False),
+    authorization: Optional[str] = Header(None),
+    x_poe_access_key: Optional[str] = Header(None, convert_underscores=False),
+):
+    """
+    Poe server-bot endpoint.
+    - Controleert access key in headers: 'poe-access-key' (voorkeur), of 'x-poe-access-key'.
+    - Parse't het user bericht.
+    - Stuurt antwoord in exact Poe-formaat.
+    """
+    body = await request.body()
+    try:
+        payload = json.loads(body.decode("utf-8") or "{}")
+    except Exception:
+        payload = {}
+
+    # === KEY check ===
+    supplied = poe_access_key or x_poe_access_key or (authorization or "").replace("Bearer ", "").strip()
+    if POE_KEY:
+        if not supplied or supplied.strip() != POE_KEY.strip():
+            # Log veilig (niet de echte KEY printen)
+            log.warning("Forbidden: access key mismatch. Received headers: poe-access-key=%s x-poe-access-key=%s auth=%s",
+                        bool(poe_access_key), bool(x_poe_access_key), bool(authorization))
+            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+
+    # === User text ===
+    user_text = get_user_text(payload).lower().strip()
+
+    # === Commands ===
+    if user_text in ("help", "h", "?"):
+        return poe_reply(
+            "Beschikbare commando’s:\n"
+            "• account – status van je Alpaca paper account\n"
+            "• help – dit scherm\n"
+            "\nProtip: Als je ‘account’ krijgt met fout, check in Render of ALPACA_API_KEY/ALPACA_SECRET_KEY goed staan."
         )
 
-    if cmd == "ping":
-        return poe_text("pong 🏓")
+    if user_text.startswith("account"):
+        return poe_reply(alpaca_account_text())
 
-    if cmd == "mode":
-        return poe_text(f"Servermodus: {os.environ.get('MODE','(niet gezet)')}")
-
-    if cmd == "account":
-        # Laat accountinformatie via Alpaca Paper zien (als keys aanwezig)
-        ALPACA_KEY = os.environ.get("ALPACA_KEY_ID", "").strip()
-        ALPACA_SECRET = os.environ.get("ALPACA_SECRET_KEY", "").strip()
-        if not (ALPACA_KEY and ALPACA_SECRET):
-            return poe_text("Alpaca keys ontbreken. Zet ALPACA_KEY_ID en ALPACA_SECRET_KEY in Render → Environment.")
-
-        endpoint = os.environ.get("ALPACA_ENDPOINT", "https://paper-api.alpaca.markets/v2")
-        try:
-            r = requests.get(
-                f"{endpoint}/account",
-                headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
-                timeout=10,
-            )
-            if r.status_code != 200:
-                return poe_text(f"Alpaca fout ({r.status_code}): {r.text[:200]}")
-            acc = r.json()
-            msg = (
-                "📊 Alpaca Paper account\n"
-                f"• Status: {acc.get('status','?')}\n"
-                f"• Equity: {acc.get('equity','?')}\n"
-                f"• Cash: {acc.get('cash','?')}\n"
-                f"• Buying power: {acc.get('buying_power','?')}\n"
-            )
-            return poe_text(msg, suggestions=["mode", "ping"])
-        except Exception as e:
-            return poe_text(f"Kon Alpaca niet bereiken: {e}")
-
-    # Default: echo / niet herkend
-    return poe_text(f"Ik heb “{user_text}” ontvangen, maar herken dit commando niet. Typ ‘help’.", suggestions=["help","account","mode"])
-    
-
-if __name__ == "__main__":
-    # Voor lokale test (Render gebruikt je start command)
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+    if not user_text:
+        return poe_reply("Ik heb geen tekst ontvangen. Typ ‘help’ of ‘account’.")
+    else:
+        return poe_reply(f"Ik heb je bericht ontvangen: “{user_text}”. Typ ‘help’ voor opties.")
