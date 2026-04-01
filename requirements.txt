@@ -2,3 +2,6 @@ fastapi
 uvicorn
 requests
 pydantic
+MetaTrader5
+pandas
+numpy
